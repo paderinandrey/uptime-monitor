@@ -1,5 +1,4 @@
 use askama::Template;
-use chrono::Timelike;
 use askama_axum::IntoResponse as AskamaIntoResponse;
 use axum::{
     extract::{Form, Path, State},
@@ -8,6 +7,7 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use chrono::Timelike;
 use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
 use reqwest::Client;
@@ -17,7 +17,7 @@ use tokio::time::{self, Duration};
 use validator::Validate;
 
 enum ApiError {
-    SQL(sqlx::Error)
+    SQLError(sqlx::Error),
 }
 
 impl From<sqlx::Error> for ApiError {
@@ -37,41 +37,6 @@ impl AxumIntoResponse for ApiError {
             }
         }
     }
-}
-
-async fn create_website(
-    State(state): State<AppState>,
-    Form(new_website): Form<Website>,
-) -> Result<impl AxumIntoResponse, impl AxumIntoResponse> {
-    if new_website.validate().is_err() {
-        return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Validation error: is your website a reachable URL?",
-        ));
-    }
-
-    sqlx::query("INSERT INTO websites (url, alias) VALUES ($1, $2)")
-        .bind(new_website.url)
-        .bind(new_website.alias)
-        .execute(&state.db)
-        .await
-        .unwrap();
-
-    Ok(Redirect::to("/"))
-}
-
-#[derive(Serialize, Validate)]
-struct WebsiteInfo {
-    #[validate(url)]
-    url: String,
-    alias: String,
-    data: Vec<WebsiteStats>,
-}
-
-#[derive(sqlx::FromRow, Serialize)]
-pub struct WebsiteStats {
-    time: DateTime<Utc>,
-    uptime_pct: Option<i16>,
 }
 
 async fn get_websites(State(state): State<AppState>) -> Result<impl AskamaIntoResponse, ApiError> {
@@ -94,15 +59,8 @@ async fn get_websites(State(state): State<AppState>) -> Result<impl AskamaIntoRe
     Ok(WebsiteLogs { logs })
 }
 
-#[derive(sqlx::FromRow, Serialize)]
-pub struct WebsiteStats {
-    time: DateTime<Utc>,
-    uptime_pct: Option<i16>,
-}
-
 async fn get_daily_stats(alias: &str, db: &PgPool) -> Result<Vec<WebsiteStats>, ApiError> {
-    let data = sqlx
-    ::query_as::<_, WebsiteStats>(
+    let data = sqlx::query_as::<_, WebsiteStats>(
         r#"
             SELECT date_trunc('hour', created_at) as time,
             CAST(COUNT(case when status = 200 then 1 end) * 100 / COUNT(*) AS int2) as uptime_pct
@@ -112,10 +70,11 @@ async fn get_daily_stats(alias: &str, db: &PgPool) -> Result<Vec<WebsiteStats>, 
             group by time
             order by time asc
             limit 24
-            "#
+            "#,
     )
         .bind(alias)
-        .fetch_all(db).await?;
+        .fetch_all(db)
+        .await?;
 
     let number_of_splits = 24;
     let number_of_seconds = 3600;
@@ -125,21 +84,42 @@ async fn get_daily_stats(alias: &str, db: &PgPool) -> Result<Vec<WebsiteStats>, 
     Ok(data)
 }
 
+async fn get_monthly_stats(alias: &str, db: &PgPool) -> Result<Vec<WebsiteStats>, ApiError> {
+    let data = sqlx::query_as::<_, WebsiteStats>(
+        r#"
+            SELECT date_trunc('day', created_at) as time,
+            CAST(COUNT(case when status = 200 then 1 end) * 100 / COUNT(*) AS int2) as uptime_pct
+            FROM logs
+            LEFT JOIN websites on websites.id = logs.website_id
+            WHERE websites.alias = $1
+            group by time
+            order by time asc
+            limit 30
+            "#,
+    )
+        .bind(alias)
+        .fetch_all(db)
+        .await?;
+
+    let number_of_splits = 30;
+    let number_of_seconds = 86400;
+
+    let data = fill_data_gaps(data, number_of_splits, SplitBy::Day, number_of_seconds);
+    Ok(data)
+}
+
 enum SplitBy {
     Hour,
-    Day
+    Day,
 }
 
 fn fill_data_gaps(
     mut data: Vec<WebsiteStats>,
     splits: i32,
     format: SplitBy,
-    number_of_seconds: i32
+    number_of_seconds: i32,
 ) -> Vec<WebsiteStats> {
-    // if the length of data is not as long as the number of required splits (24)
-    // then we fill in the gaps
     if (data.len() as i32) < splits {
-        // for each split, format the time and check if the timestamp exists
         for i in 1..24 {
             let time = Utc::now() - chrono::Duration::seconds((number_of_seconds * i).into());
             let time = time
@@ -155,7 +135,7 @@ fn fill_data_gaps(
             } else {
                 time
             };
-            // if timestamp doesn't exist, push a timestamp with None
+
             if !data.iter().any(|x| x.time == time) {
                 data.push(WebsiteStats {
                     time,
@@ -163,25 +143,10 @@ fn fill_data_gaps(
                 });
             }
         }
-        // finally, sort the data
         data.sort_by(|a, b| b.time.cmp(&a.time));
     }
 
     data
-}
-
-#[derive(Serialize, sqlx::FromRow, Template)]
-#[template(path = "single_website.html")]
-struct SingleWebsiteLogs {
-    log: WebsiteInfo,
-    incidents: Vec<Incident>,
-    monthly_data: Vec<WebsiteStats>,
-}
-
-#[derive(sqlx::FromRow, Serialize)]
-pub struct Incident {
-    time: DateTime<Utc>,
-    status: i16,
 }
 
 async fn get_website_by_alias(
@@ -197,10 +162,7 @@ async fn get_website_by_alias(
     let monthly_data = get_monthly_stats(&website.alias, &state.db).await?;
 
     let incidents = sqlx::query_as::<_, Incident>(
-        "SELECT logs.created_at as time,
-         logs.status from logs
-         left join websites on websites.id = logs.website_id
-         where websites.alias = $1 and logs.status != 200",
+        "SELECT logs.created_at as time, logs.status from logs left join websites on websites.id = logs.website_id where websites.alias = $1 and logs.status != 200",
     )
         .bind(&alias)
         .fetch_all(&state.db)
@@ -217,6 +179,35 @@ async fn get_website_by_alias(
         incidents,
         monthly_data,
     })
+}
+
+async fn styles() -> impl AxumIntoResponse {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "text/css")
+        .body(include_str!("../templates/styles.css").to_owned())
+        .unwrap()
+}
+
+async fn create_website(
+    State(state): State<AppState>,
+    Form(new_website): Form<Website>,
+) -> Result<impl AxumIntoResponse, impl AxumIntoResponse> {
+    if new_website.validate().is_err() {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Validation error: is your website a reachable URL?",
+        ));
+    }
+
+    sqlx::query("INSERT INTO websites (url, alias) VALUES ($1, $2)")
+        .bind(new_website.url)
+        .bind(new_website.alias)
+        .execute(&state.db)
+        .await
+        .unwrap();
+
+    Ok(Redirect::to("/"))
 }
 
 async fn delete_website(
@@ -249,7 +240,75 @@ async fn delete_website(
 struct Website {
     #[validate(url)]
     url: String,
-    alias: String
+    alias: String,
+}
+
+#[derive(Serialize, sqlx::FromRow, Template)]
+#[template(path = "index.html")]
+struct WebsiteLogs {
+    logs: Vec<WebsiteInfo>,
+}
+
+#[derive(Serialize, sqlx::FromRow, Template)]
+#[template(path = "single_website.html")]
+struct SingleWebsiteLogs {
+    log: WebsiteInfo,
+    incidents: Vec<Incident>,
+    monthly_data: Vec<WebsiteStats>,
+}
+
+#[derive(sqlx::FromRow, Serialize)]
+pub struct Incident {
+    time: DateTime<Utc>,
+    status: i16,
+}
+
+#[derive(sqlx::FromRow, Serialize)]
+pub struct WebsiteStats {
+    time: DateTime<Utc>,
+    uptime_pct: Option<i16>,
+}
+
+#[derive(Serialize, Validate)]
+struct WebsiteInfo {
+    #[validate(url)]
+    url: String,
+    alias: String,
+    data: Vec<WebsiteStats>,
+}
+
+#[derive(Clone)]
+struct AppState {
+    db: PgPool,
+}
+
+impl AppState {
+    fn new(db: PgPool) -> Self {
+        Self { db }
+    }
+}
+
+#[shuttle_runtime::main]
+async fn main(#[shuttle_shared_db::Postgres] db: PgPool) -> shuttle_axum::ShuttleAxum {
+    sqlx::migrate!().run(&db).await.unwrap();
+
+    let state = AppState::new(db.clone());
+
+    tokio::spawn(async move {
+        check_websites(db).await;
+    });
+
+    let router = Router::new()
+        .route("/", get(get_websites))
+        .route("/websites", post(create_website))
+        .route(
+            "/websites/:alias",
+            get(get_website_by_alias).delete(delete_website),
+        )
+        .route("/styles.css", get(styles))
+        .with_state(state);
+
+    Ok(router.into())
 }
 
 async fn check_websites(db: PgPool) {
@@ -267,43 +326,15 @@ async fn check_websites(db: PgPool) {
             let response = ctx.get(website.url).send().await.unwrap();
 
             sqlx::query(
-                "INSERT INTO logs (website_alias, status)
+                "INSERT INTO logs (website_id, status)
                         VALUES
-                        ((SELECT id FROM websites where alias = $1), $2)"
+                        ((SELECT id FROM websites where alias = $1), $2)",
             )
                 .bind(website.alias)
                 .bind(response.status().as_u16() as i16)
-                .execute(&db).await
+                .execute(&db)
+                .await
                 .unwrap();
         }
     }
-}
-
-async fn hello_world() -> &'static str {
-    "Hello, world!"
-}
-
-#[derive(Clone)]
-struct AppState {
-    db: PgPool,
-}
-
-impl AppState {
-    fn new(db: PgPool) -> Self {
-        Self { db }
-    }
-}
-
-#[shuttle_runtime::main]
-async fn main(
-    #[shuttle_shared_db::Postgres] db: PgPool
-) -> shuttle_axum::ShuttleAxum {
-    // carry out migrations
-    sqlx::migrate!().run(&db).await.expect("Migrations went wrong :(");
-
-    let state = AppState::new(db);
-
-    let router = Router::new().route("/", get(hello_world)).with_state(state);
-
-    Ok(router.into())
 }
